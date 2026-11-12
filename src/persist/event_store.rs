@@ -555,9 +555,16 @@ mod event_store_test {
     };
     use crate::{Aggregate, AggregateError, DomainEvent, EventStore};
 
+    enum CheckpointOutcome {
+        Success,
+        Conflict,
+    }
+
     struct CheckpointRepo {
         legacy: MockRepo,
         expected: Option<SerializedSnapshot>,
+        expected_sequences: Vec<usize>,
+        outcome: CheckpointOutcome,
         calls: Arc<AtomicUsize>,
     }
 
@@ -596,12 +603,22 @@ mod event_store_test {
 
         async fn persist_with_snapshot<A: Aggregate>(
             &self,
-            _events: &[SerializedEvent],
+            events: &[SerializedEvent],
             snapshot_update: Option<SerializedSnapshot>,
         ) -> Result<(), PersistenceError> {
             assert_eq!(snapshot_update.as_ref(), self.expected.as_ref());
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event.sequence)
+                    .collect::<Vec<_>>(),
+                self.expected_sequences,
+            );
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            match self.outcome {
+                CheckpointOutcome::Success => Ok(()),
+                CheckpointOutcome::Conflict => Err(PersistenceError::OptimisticLockError),
+            }
         }
 
         async fn stream_events<A: Aggregate>(
@@ -627,6 +644,8 @@ mod event_store_test {
                 current_sequence: 6,
                 current_snapshot: 8,
             }),
+            expected_sequences: vec![5, 6, 7],
+            outcome: CheckpointOutcome::Success,
             calls: Arc::clone(&calls),
         };
         let store = PersistedEventStore::<_, TestAggregate>::new_snapshot_store(repo, 3);
@@ -657,6 +676,8 @@ mod event_store_test {
         let repo = CheckpointRepo {
             legacy: MockRepo::with_commit(Box::new(|_, _| {})),
             expected: None,
+            expected_sequences: vec![1],
+            outcome: CheckpointOutcome::Success,
             calls: Arc::clone(&calls),
         };
         let store = PersistedEventStore::<_, TestAggregate>::new_event_store(repo);
@@ -672,6 +693,31 @@ mod event_store_test {
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].sequence, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_errors_preserve_aggregate_conflict() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repo = CheckpointRepo {
+            legacy: MockRepo::with_commit(Box::new(|_, _| {})),
+            expected: None,
+            expected_sequences: vec![1],
+            outcome: CheckpointOutcome::Conflict,
+            calls: Arc::clone(&calls),
+        };
+        let store = PersistedEventStore::<_, TestAggregate>::new_event_store(repo);
+        let context = EventStoreAggregateContext {
+            aggregate_id: TEST_AGGREGATE_ID.to_string(),
+            aggregate: TestAggregate::default(),
+            current_sequence: 0,
+            current_snapshot: None,
+        };
+        let error = store
+            .commit(vec![TestEvents::Started], context, HashMap::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AggregateError::AggregateConflict));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
