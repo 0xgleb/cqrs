@@ -1,12 +1,10 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use serde_json::Value;
-
 use crate::persist::serialized_event::{deserialize_events, serialize_events};
 use crate::persist::{
     EventStoreAggregateContext, EventUpcaster, PersistedEventRepository, PersistenceError,
-    SerializedEvent,
+    SerializedEvent, SerializedSnapshot,
 };
 use crate::{Aggregate, AggregateError, EventEnvelope, EventStore};
 
@@ -269,7 +267,7 @@ where
         let commit_snapshot_to_event = self
             .storage
             .commit_snapshot_with_addl_events(context.current_sequence, events.len());
-        let snapshot_update: Option<(Value, usize)> = if commit_snapshot_to_event == 0 {
+        let snapshot_update: Option<SerializedSnapshot> = if commit_snapshot_to_event == 0 {
             None
         } else {
             match self.storage {
@@ -279,9 +277,8 @@ where
         };
         let wrapped_events = Self::wrap_events(&aggregate_id, last_sequence, events, metadata);
         let serialized_events: Vec<SerializedEvent> = serialize_events(&wrapped_events)?;
-        let snapshot_update = snapshot_update.map(|s| (aggregate_id, s.0, s.1));
         self.repo
-            .persist::<A>(&serialized_events, snapshot_update)
+            .persist_with_snapshot::<A>(&serialized_events, snapshot_update)
             .await?;
         Ok(wrapped_events)
     }
@@ -296,7 +293,7 @@ where
         events: &[<A as Aggregate>::Event],
         mut context: EventStoreAggregateContext<A>,
         commit_snapshot_to_event: usize,
-    ) -> Result<Option<(Value, usize)>, AggregateError<A::Error>> {
+    ) -> Result<Option<SerializedSnapshot>, AggregateError<A::Error>> {
         for (i, event) in events.iter().cloned().enumerate() {
             if i < commit_snapshot_to_event {
                 context.aggregate.apply(event);
@@ -305,7 +302,12 @@ where
         }
         let next_snapshot = context.current_snapshot.map_or(1, |val| val + 1);
         let payload = serde_json::to_value(context.aggregate)?;
-        Ok(Some((payload, next_snapshot)))
+        Ok(Some(SerializedSnapshot {
+            aggregate_id: context.aggregate_id,
+            aggregate: payload,
+            current_sequence: context.current_sequence,
+            current_snapshot: next_snapshot,
+        }))
     }
 
     /// Method to wrap a set of events with the additional metadata needed for persistence and publishing
@@ -538,13 +540,140 @@ pub(crate) mod shared_test {
 #[cfg(test)]
 mod event_store_test {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use serde_json::json;
 
     use crate::persist::event_store::shared_test::{
         test_serialized_event, MockRepo, TestAggregate, TestEvents, EVENT_VERSION,
         TEST_AGGREGATE_ID,
     };
-    use crate::persist::{EventStoreAggregateContext, PersistedEventStore, PersistenceError};
-    use crate::{AggregateError, DomainEvent, EventStore};
+    use crate::persist::{
+        EventStoreAggregateContext, PersistedEventRepository, PersistedEventStore,
+        PersistenceError, ReplayStream, SerializedEvent, SerializedSnapshot,
+    };
+    use crate::{Aggregate, AggregateError, DomainEvent, EventStore};
+
+    struct CheckpointRepo {
+        legacy: MockRepo,
+        expected: Option<SerializedSnapshot>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl PersistedEventRepository for CheckpointRepo {
+        async fn get_events<A: Aggregate>(
+            &self,
+            aggregate_id: &str,
+        ) -> Result<Vec<SerializedEvent>, PersistenceError> {
+            self.legacy.get_events::<A>(aggregate_id).await
+        }
+
+        async fn get_last_events<A: Aggregate>(
+            &self,
+            aggregate_id: &str,
+            last_sequence: usize,
+        ) -> Result<Vec<SerializedEvent>, PersistenceError> {
+            self.legacy
+                .get_last_events::<A>(aggregate_id, last_sequence)
+                .await
+        }
+
+        async fn get_snapshot<A: Aggregate>(
+            &self,
+            aggregate_id: &str,
+        ) -> Result<Option<SerializedSnapshot>, PersistenceError> {
+            self.legacy.get_snapshot::<A>(aggregate_id).await
+        }
+
+        async fn persist<A: Aggregate>(
+            &self,
+            events: &[SerializedEvent],
+            snapshot_update: Option<(String, serde_json::Value, usize)>,
+        ) -> Result<(), PersistenceError> {
+            self.legacy.persist::<A>(events, snapshot_update).await
+        }
+
+        async fn persist_with_snapshot<A: Aggregate>(
+            &self,
+            _events: &[SerializedEvent],
+            snapshot_update: Option<SerializedSnapshot>,
+        ) -> Result<(), PersistenceError> {
+            assert_eq!(snapshot_update.as_ref(), self.expected.as_ref());
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn stream_events<A: Aggregate>(
+            &self,
+            aggregate_id: &str,
+        ) -> Result<ReplayStream, PersistenceError> {
+            self.legacy.stream_events::<A>(aggregate_id).await
+        }
+
+        async fn stream_all_events<A: Aggregate>(&self) -> Result<ReplayStream, PersistenceError> {
+            self.legacy.stream_all_events::<A>().await
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_commit_preserves_covered_sequence_and_snapshot_version() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repo = CheckpointRepo {
+            legacy: MockRepo::with_commit(Box::new(|_, _| {})),
+            expected: Some(SerializedSnapshot {
+                aggregate_id: TEST_AGGREGATE_ID.to_string(),
+                aggregate: json!({"something_happened": 5}),
+                current_sequence: 6,
+                current_snapshot: 8,
+            }),
+            calls: Arc::clone(&calls),
+        };
+        let store = PersistedEventStore::<_, TestAggregate>::new_snapshot_store(repo, 3);
+        let context = EventStoreAggregateContext {
+            aggregate_id: TEST_AGGREGATE_ID.to_string(),
+            aggregate: TestAggregate {
+                something_happened: 3,
+            },
+            current_sequence: 4,
+            current_snapshot: Some(7),
+        };
+        let events = store
+            .commit(
+                vec![TestEvents::SomethingWasDone; 3],
+                context,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[2].sequence, 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn event_store_commit_forwards_no_snapshot() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repo = CheckpointRepo {
+            legacy: MockRepo::with_commit(Box::new(|_, _| {})),
+            expected: None,
+            calls: Arc::clone(&calls),
+        };
+        let store = PersistedEventStore::<_, TestAggregate>::new_event_store(repo);
+        let context = EventStoreAggregateContext {
+            aggregate_id: TEST_AGGREGATE_ID.to_string(),
+            aggregate: TestAggregate::default(),
+            current_sequence: 0,
+            current_snapshot: None,
+        };
+        let events = store
+            .commit(vec![TestEvents::Started], context, HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn load() {

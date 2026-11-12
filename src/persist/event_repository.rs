@@ -33,6 +33,29 @@ pub trait PersistedEventRepository: Send + Sync {
         snapshot_update: Option<(String, Value, usize)>,
     ) -> impl Future<Output = Result<(), PersistenceError>> + Send;
 
+    /// Commits events with the snapshot's explicit covered sequence and version.
+    ///
+    /// Snapshot-aware repositories should override this method to persist
+    /// `current_sequence` independently of the command batch's final sequence.
+    /// The default adapter preserves compatibility with existing repositories
+    /// by forwarding the legacy snapshot tuple to `persist`.
+    fn persist_with_snapshot<A: Aggregate>(
+        &self,
+        events: &[SerializedEvent],
+        snapshot_update: Option<SerializedSnapshot>,
+    ) -> impl Future<Output = Result<(), PersistenceError>> + Send {
+        self.persist::<A>(
+            events,
+            snapshot_update.map(|snapshot| {
+                (
+                    snapshot.aggregate_id,
+                    snapshot.aggregate,
+                    snapshot.current_snapshot,
+                )
+            }),
+        )
+    }
+
     /// Streams all events for an aggregate instance.
     fn stream_events<A: Aggregate>(
         &self,
