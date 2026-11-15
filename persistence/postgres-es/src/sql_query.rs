@@ -11,9 +11,14 @@ pub(crate) struct SqlQueryFactory {
 }
 
 impl SqlQueryFactory {
-    pub fn new(event_table: impl SqlSafeStr, snapshot_table: impl SqlSafeStr) -> Self {
+    pub fn new(
+        event_table: impl SqlSafeStr,
+        snapshot_table: impl SqlSafeStr,
+        snapshot_counter: impl SqlSafeStr,
+    ) -> Self {
         let event_table = event_table.into_sql_str();
         let snapshot_table = snapshot_table.into_sql_str();
+        let snapshot_counter = snapshot_counter.into_sql_str();
         let select_events = AssertSqlSafe(format!(
             "
 SELECT aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata
@@ -41,24 +46,28 @@ SELECT aggregate_type, aggregate_id, sequence, event_type, event_version, payloa
         .into_sql_str();
         let insert_snapshot = AssertSqlSafe(format!(
             "
-INSERT INTO {} (aggregate_type, aggregate_id, last_sequence, current_snapshot, payload)
+INSERT INTO {} (aggregate_type, aggregate_id, last_sequence, {}, payload)
 VALUES ($1, $2, $3, $4, $5)",
-            snapshot_table.as_str()
+            snapshot_table.as_str(),
+            snapshot_counter.as_str()
         ))
         .into_sql_str();
         let update_snapshot = AssertSqlSafe(format!(
             "
 UPDATE {}
-  SET last_sequence= $3 , payload= $6, current_snapshot= $4
-  WHERE aggregate_type= $1 AND aggregate_id= $2 AND current_snapshot= $5",
-            snapshot_table.as_str()
+  SET last_sequence= $3 , payload= $6, {}= $4
+  WHERE aggregate_type= $1 AND aggregate_id= $2 AND {}= $5",
+            snapshot_table.as_str(),
+            snapshot_counter.as_str(),
+            snapshot_counter.as_str()
         ))
         .into_sql_str();
         let select_snapshot = AssertSqlSafe(format!(
             "
-SELECT aggregate_type, aggregate_id, last_sequence, current_snapshot, payload
+SELECT aggregate_type, aggregate_id, last_sequence, {} AS current_snapshot, payload
   FROM {}
   WHERE aggregate_type = $1 AND aggregate_id = $2",
+            snapshot_counter.as_str(),
             snapshot_table.as_str()
         ))
         .into_sql_str();
@@ -106,7 +115,7 @@ SELECT aggregate_type, aggregate_id, sequence, event_type, event_version, payloa
 
 #[test]
 fn test_queries() {
-    let query_factory = SqlQueryFactory::new("my_events", "my_snapshots");
+    let query_factory = SqlQueryFactory::new("my_events", "my_snapshots", "current_snapshot");
     assert_eq!(
         query_factory.select_events().as_str(),
         "
@@ -142,7 +151,7 @@ UPDATE my_snapshots
     assert_eq!(
         query_factory.select_snapshot().as_str(),
         "
-SELECT aggregate_type, aggregate_id, last_sequence, current_snapshot, payload
+SELECT aggregate_type, aggregate_id, last_sequence, current_snapshot AS current_snapshot, payload
   FROM my_snapshots
   WHERE aggregate_type = $1 AND aggregate_id = $2"
     );

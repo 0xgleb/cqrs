@@ -15,6 +15,29 @@ const DEFAULT_SNAPSHOT_TABLE: &str = "snapshots";
 
 const DEFAULT_STREAMING_CHANNEL_SIZE: usize = 200;
 
+#[derive(Debug, PartialEq, Eq)]
+struct PostgresIndex(i64);
+
+impl TryFrom<usize> for PostgresIndex {
+    type Error = PostgresAggregateError;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        let stored = i64::try_from(value)?;
+        Self::try_from(stored)
+    }
+}
+
+impl TryFrom<i64> for PostgresIndex {
+    type Error = PostgresAggregateError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        if value <= 0 {
+            return Err(PostgresAggregateError::NonPositiveIndex { value });
+        }
+        Ok(Self(value))
+    }
+}
+
 /// An event repository relying on a Postgres database for persistence.
 pub struct PostgresEventRepository {
     pool: Pool<Postgres>,
@@ -45,16 +68,8 @@ impl PersistedEventRepository for PostgresEventRepository {
         &self,
         aggregate_id: &str,
     ) -> Result<Option<SerializedSnapshot>, PersistenceError> {
-        let Some(row) = sqlx::query(self.query_factory.select_snapshot())
-            .bind(A::TYPE)
-            .bind(aggregate_id)
-            .fetch_optional(&self.pool)
+        self.select_snapshot(&self.pool, A::TYPE, aggregate_id)
             .await
-            .map_err(PostgresAggregateError::from)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(Self::deser_snapshot(&row)))
     }
 
     async fn persist<A: Aggregate>(
@@ -126,10 +141,16 @@ fn stream_events(
                     return;
                 }
             };
-            let event = PostgresEventRepository::deser_event(&row);
-            if feed.push(Ok(event)).await.is_err() {
-                // TODO: in the unlikely event of a broken channel this error should be reported.
-                return;
+            match PostgresEventRepository::deser_event(&row) {
+                Ok(event) => {
+                    if feed.push(Ok(event)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = feed.push(Err(error.into())).await;
+                    return;
+                }
             }
         }
     });
@@ -153,7 +174,7 @@ impl PostgresEventRepository {
             .await
             .map_err(PostgresAggregateError::from)?
         {
-            result.push(Self::deser_event(&row));
+            result.push(Self::deser_event(&row)?);
         }
         Ok(result)
     }
@@ -223,8 +244,51 @@ impl PostgresEventRepository {
     ) -> Self {
         Self {
             pool,
-            query_factory: SqlQueryFactory::new(events_table, snapshots_table),
+            query_factory: SqlQueryFactory::new(events_table, snapshots_table, "current_snapshot"),
             stream_channel_size: DEFAULT_STREAMING_CHANNEL_SIZE,
+        }
+    }
+
+    async fn select_snapshot<'connection>(
+        &self,
+        executor: impl Executor<'connection, Database = Postgres>,
+        aggregate_type: &'connection str,
+        aggregate_id: &'connection str,
+    ) -> Result<Option<SerializedSnapshot>, PersistenceError> {
+        let row = sqlx::query(self.query_factory.select_snapshot())
+            .bind(aggregate_type)
+            .bind(aggregate_id)
+            .fetch_optional(executor)
+            .await
+            .map_err(PostgresAggregateError::from)?;
+        row.as_ref()
+            .map(Self::deser_snapshot)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Reads the snapshot in the caller's transaction.
+    pub async fn get_snapshot_in(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        aggregate_type: &str,
+        aggregate_id: &str,
+    ) -> Result<Option<SerializedSnapshot>, PersistenceError> {
+        self.select_snapshot(&mut **transaction, aggregate_type, aggregate_id)
+            .await
+    }
+
+    /// Configures table names and the physical optimistic snapshot-counter column.
+    pub fn with_tables_and_snapshot_counter(
+        self,
+        events_table: impl SqlSafeStr,
+        snapshots_table: impl SqlSafeStr,
+        snapshot_counter: impl SqlSafeStr,
+    ) -> Self {
+        Self {
+            pool: self.pool,
+            query_factory: SqlQueryFactory::new(events_table, snapshots_table, snapshot_counter),
+            stream_channel_size: self.stream_channel_size,
         }
     }
 
@@ -267,7 +331,26 @@ impl PostgresEventRepository {
         events: &[SerializedEvent],
     ) -> Result<usize, PostgresAggregateError> {
         let query = self.query_factory.insert_event();
-        self.persist_events::<A>(query, transaction, events).await
+        self.persist_events(query, transaction, A::TYPE, events)
+            .await
+    }
+
+    /// Appends serialized events for an explicit stream type in the caller's transaction.
+    ///
+    /// The caller retains commit and rollback ownership.
+    pub async fn append_serialized_events_in(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        aggregate_type: &str,
+        events: &[SerializedEvent],
+    ) -> Result<usize, PostgresAggregateError> {
+        self.persist_events(
+            self.query_factory.insert_event(),
+            transaction,
+            aggregate_type,
+            events,
+        )
+        .await
     }
 
     pub(crate) async fn insert_events<A: Aggregate>(
@@ -275,10 +358,49 @@ impl PostgresEventRepository {
         events: &[SerializedEvent],
     ) -> Result<(), PostgresAggregateError> {
         let mut tx: Transaction<'_, Postgres> = sqlx::Acquire::begin(&self.pool).await?;
-        self.persist_events::<A>(self.query_factory.insert_event(), &mut tx, events)
+        self.persist_events(self.query_factory.insert_event(), &mut tx, A::TYPE, events)
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Writes a snapshot in the caller's transaction and returns the affected row count.
+    ///
+    /// Zero rows indicate that the optimistic snapshot counter did not match.
+    /// The caller must check the count before committing its transaction.
+    pub async fn persist_snapshot_in(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        aggregate_type: &str,
+        snapshot: &SerializedSnapshot,
+    ) -> Result<u64, PostgresAggregateError> {
+        let PostgresIndex(sequence) = PostgresIndex::try_from(snapshot.current_sequence)?;
+        let PostgresIndex(version) = PostgresIndex::try_from(snapshot.current_snapshot)?;
+        let result = if version == 1 {
+            sqlx::query(self.query_factory.insert_snapshot())
+                .bind(aggregate_type)
+                .bind(&snapshot.aggregate_id)
+                .bind(sequence)
+                .bind(version)
+                .bind(&snapshot.aggregate)
+                .execute(&mut **transaction)
+                .await?
+        } else {
+            sqlx::query(self.query_factory.update_snapshot())
+                .bind(aggregate_type)
+                .bind(&snapshot.aggregate_id)
+                .bind(sequence)
+                .bind(version)
+                .bind(
+                    version
+                        .checked_sub(1)
+                        .ok_or(PostgresAggregateError::NonPositiveIndex { value: version })?,
+                )
+                .bind(&snapshot.aggregate)
+                .execute(&mut **transaction)
+                .await?
+        };
+        Ok(result.rows_affected())
     }
 
     pub(crate) async fn insert<A: Aggregate>(
@@ -290,16 +412,19 @@ impl PostgresEventRepository {
     ) -> Result<(), PostgresAggregateError> {
         let mut tx: Transaction<'_, Postgres> = sqlx::Acquire::begin(&self.pool).await?;
         let current_sequence = self
-            .persist_events::<A>(self.query_factory.insert_event(), &mut tx, events)
+            .persist_events(self.query_factory.insert_event(), &mut tx, A::TYPE, events)
             .await?;
-        sqlx::query(self.query_factory.insert_snapshot())
-            .bind(A::TYPE)
-            .bind(aggregate_id.as_str())
-            .bind(current_sequence as i32)
-            .bind(current_snapshot as i32)
-            .bind(&aggregate_payload)
-            .execute(&mut *tx)
-            .await?;
+        self.persist_snapshot_in(
+            &mut tx,
+            A::TYPE,
+            &SerializedSnapshot {
+                aggregate_id,
+                aggregate: aggregate_payload,
+                current_sequence,
+                current_snapshot,
+            },
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -313,38 +438,38 @@ impl PostgresEventRepository {
     ) -> Result<(), PostgresAggregateError> {
         let mut tx: Transaction<'_, Postgres> = sqlx::Acquire::begin(&self.pool).await?;
         let current_sequence = self
-            .persist_events::<A>(self.query_factory.insert_event(), &mut tx, events)
+            .persist_events(self.query_factory.insert_event(), &mut tx, A::TYPE, events)
             .await?;
 
-        let aggregate_payload = serde_json::to_value(&aggregate)?;
-        let result = sqlx::query(self.query_factory.update_snapshot())
-            .bind(A::TYPE)
-            .bind(aggregate_id.as_str())
-            .bind(current_sequence as i32)
-            .bind(current_snapshot as i32)
-            .bind((current_snapshot - 1) as i32)
-            .bind(&aggregate_payload)
-            .execute(&mut *tx)
+        let rows = self
+            .persist_snapshot_in(
+                &mut tx,
+                A::TYPE,
+                &SerializedSnapshot {
+                    aggregate_id,
+                    aggregate,
+                    current_sequence,
+                    current_snapshot,
+                },
+            )
             .await?;
         tx.commit().await?;
-        match result.rows_affected() {
+        match rows {
             1 => Ok(()),
             _ => Err(PostgresAggregateError::OptimisticLock),
         }
     }
 
-    fn deser_event(row: &PgRow) -> SerializedEvent {
-        let aggregate_type: String = row.get("aggregate_type");
-        let aggregate_id: String = row.get("aggregate_id");
-        let sequence = {
-            let s: i64 = row.get("sequence");
-            s as usize
-        };
-        let event_type: String = row.get("event_type");
-        let event_version: String = row.get("event_version");
-        let payload: Value = row.get("payload");
-        let metadata: Value = row.get("metadata");
-        SerializedEvent::new(
+    fn deser_event(row: &PgRow) -> Result<SerializedEvent, PostgresAggregateError> {
+        let aggregate_type: String = row.try_get("aggregate_type")?;
+        let aggregate_id: String = row.try_get("aggregate_id")?;
+        let PostgresIndex(sequence) = PostgresIndex::try_from(row.try_get::<i64, _>("sequence")?)?;
+        let sequence = usize::try_from(sequence)?;
+        let event_type: String = row.try_get("event_type")?;
+        let event_version: String = row.try_get("event_version")?;
+        let payload: Value = row.try_get("payload")?;
+        let metadata: Value = row.try_get("metadata")?;
+        Ok(SerializedEvent::new(
             aggregate_id,
             sequence,
             aggregate_type,
@@ -352,41 +477,43 @@ impl PostgresEventRepository {
             event_version,
             payload,
             metadata,
-        )
+        ))
     }
 
-    fn deser_snapshot(row: &PgRow) -> SerializedSnapshot {
-        let aggregate_id = row.get("aggregate_id");
-        let s: i64 = row.get("last_sequence");
-        let current_sequence = s as usize;
-        let s: i64 = row.get("current_snapshot");
-        let current_snapshot = s as usize;
-        let aggregate: Value = row.get("payload");
-        SerializedSnapshot {
+    fn deser_snapshot(row: &PgRow) -> Result<SerializedSnapshot, PostgresAggregateError> {
+        let aggregate_id = row.try_get("aggregate_id")?;
+        let PostgresIndex(sequence) =
+            PostgresIndex::try_from(row.try_get::<i64, _>("last_sequence")?)?;
+        let PostgresIndex(version) =
+            PostgresIndex::try_from(row.try_get::<i64, _>("current_snapshot")?)?;
+        let aggregate: Value = row.try_get("payload")?;
+        Ok(SerializedSnapshot {
             aggregate_id,
             aggregate,
-            current_sequence,
-            current_snapshot,
-        }
+            current_sequence: usize::try_from(sequence)?,
+            current_snapshot: usize::try_from(version)?,
+        })
     }
 
-    pub(crate) async fn persist_events<A: Aggregate>(
+    pub(crate) async fn persist_events(
         &self,
         inser_event_query: SqlStr,
         tx: &mut Transaction<'_, Postgres>,
+        aggregate_type: &str,
         events: &[SerializedEvent],
     ) -> Result<usize, PostgresAggregateError> {
         let mut current_sequence: usize = 0;
         for event in events {
+            let PostgresIndex(sequence) = PostgresIndex::try_from(event.sequence)?;
             current_sequence = event.sequence;
             let event_type = &event.event_type;
             let event_version = &event.event_version;
             let payload = serde_json::to_value(&event.payload)?;
             let metadata = serde_json::to_value(&event.metadata)?;
             sqlx::query(inser_event_query.clone())
-                .bind(A::TYPE)
+                .bind(aggregate_type)
                 .bind(event.aggregate_id.as_str())
-                .bind(event.sequence as i32)
+                .bind(sequence)
                 .bind(event_type)
                 .bind(event_version)
                 .bind(&payload)
@@ -408,6 +535,23 @@ mod test {
         Tested, TEST_CONNECTION_STRING,
     };
     use crate::{default_postgres_pool, PostgresEventRepository};
+
+    #[test]
+    fn postgres_indexes_preserve_bigint_range_and_reject_nonpositive_storage() {
+        let value = i64::from(i32::MAX) + 1;
+        assert_eq!(
+            super::PostgresIndex::try_from(usize::try_from(value).unwrap()).unwrap(),
+            super::PostgresIndex(value)
+        );
+        assert_eq!(
+            super::PostgresIndex::try_from(value).unwrap(),
+            super::PostgresIndex(value)
+        );
+        for value in [0_i64, -1] {
+            assert!(matches!(super::PostgresIndex::try_from(value).unwrap_err(),
+                PostgresAggregateError::NonPositiveIndex { value: actual } if actual == value));
+        }
+    }
 
     #[tokio::test]
     async fn replay_reports_a_closed_pool_without_panicking_or_silent_eof() {
