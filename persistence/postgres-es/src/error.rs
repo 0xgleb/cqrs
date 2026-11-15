@@ -26,7 +26,9 @@ impl From<sqlx::Error> for PostgresAggregateError {
                 }
                 Self::UnknownError(Box::new(err))
             }
-            Error::Io(_) | Error::Tls(_) => Self::ConnectionError(Box::new(err)),
+            Error::Io(_) | Error::Tls(_) | Error::PoolClosed => {
+                Self::ConnectionError(Box::new(err))
+            }
             _ => Self::UnknownError(Box::new(err)),
         }
     }

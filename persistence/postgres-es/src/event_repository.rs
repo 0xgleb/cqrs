@@ -114,7 +114,17 @@ fn stream_events(
     tokio::spawn(async move {
         let query = sqlx::query(query).bind(&aggregate_type).bind(&aggregate_id);
         let mut rows = query.fetch(&pool);
-        while let Some(row) = rows.try_next().await.unwrap() {
+        loop {
+            let row = match rows.try_next().await {
+                Ok(Some(row)) => row,
+                Ok(None) => return,
+                Err(source) => {
+                    let _ = feed
+                        .push(Err(PostgresAggregateError::from(source).into()))
+                        .await;
+                    return;
+                }
+            };
             let event = PostgresEventRepository::deser_event(&row);
             if feed.push(Ok(event)).await.is_err() {
                 // TODO: in the unlikely event of a broken channel this error should be reported.
@@ -354,6 +364,29 @@ mod test {
         Tested, TEST_CONNECTION_STRING,
     };
     use crate::{default_postgres_pool, PostgresEventRepository};
+
+    #[tokio::test]
+    async fn replay_reports_a_closed_pool_without_panicking_or_silent_eof() {
+        let pool = sqlx::PgPool::connect_lazy("postgresql://localhost/unused").unwrap();
+        pool.close().await;
+        let repository = PostgresEventRepository::new(pool);
+        let mut stream = repository
+            .stream_events::<TestAggregate>("closed")
+            .await
+            .unwrap();
+        let error = stream
+            .next::<TestAggregate>(&[])
+            .await
+            .expect("closed storage must produce a stream error, not successful EOF")
+            .unwrap_err();
+        let cqrs_es::persist::PersistenceError::ConnectionError(source) = error else {
+            panic!("expected a connection error from the closed pool");
+        };
+        assert!(matches!(
+            source.downcast_ref::<sqlx::Error>().unwrap(),
+            sqlx::Error::PoolClosed
+        ));
+    }
 
     #[tokio::test]
     async fn event_repositories() {
