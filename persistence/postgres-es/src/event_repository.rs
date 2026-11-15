@@ -50,8 +50,13 @@ impl PersistedEventRepository for PostgresEventRepository {
         &self,
         aggregate_id: &str,
     ) -> Result<Vec<SerializedEvent>, PersistenceError> {
-        self.select_events::<A>(aggregate_id, self.query_factory.select_events(), &self.pool)
-            .await
+        self.select_events(
+            A::TYPE,
+            aggregate_id,
+            self.query_factory.select_events(),
+            &self.pool,
+        )
+        .await
     }
 
     async fn get_last_events<A: Aggregate>(
@@ -60,7 +65,7 @@ impl PersistedEventRepository for PostgresEventRepository {
         last_sequence: usize,
     ) -> Result<Vec<SerializedEvent>, PersistenceError> {
         let query = self.query_factory.get_last_events(last_sequence);
-        self.select_events::<A>(aggregate_id, query, &self.pool)
+        self.select_events(A::TYPE, aggregate_id, query, &self.pool)
             .await
     }
 
@@ -158,14 +163,15 @@ fn stream_events(
 }
 
 impl PostgresEventRepository {
-    async fn select_events<'connection, A: Aggregate>(
+    async fn select_events<'connection>(
         &self,
+        aggregate_type: &'connection str,
         aggregate_id: &'connection str,
         query: SqlStr,
         executor: impl Executor<'connection, Database = Postgres>,
     ) -> Result<Vec<SerializedEvent>, PersistenceError> {
         let mut rows = sqlx::query(query)
-            .bind(A::TYPE)
+            .bind(aggregate_type)
             .bind(aggregate_id)
             .fetch(executor);
         let mut result = Vec::default();
@@ -292,13 +298,30 @@ impl PostgresEventRepository {
         }
     }
 
+    /// Loads serialized events for an explicit stream type in the caller's transaction.
+    pub async fn get_serialized_events_in(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        aggregate_type: &str,
+        aggregate_id: &str,
+    ) -> Result<Vec<SerializedEvent>, PersistenceError> {
+        self.select_events(
+            aggregate_type,
+            aggregate_id,
+            self.query_factory.select_events(),
+            &mut **transaction,
+        )
+        .await
+    }
+
     /// Loads a stream using the caller's transaction and its visibility boundary.
     pub async fn get_events_in<A: Aggregate>(
         &self,
         transaction: &mut Transaction<'_, Postgres>,
         aggregate_id: &str,
     ) -> Result<Vec<SerializedEvent>, PersistenceError> {
-        self.select_events::<A>(
+        self.select_events(
+            A::TYPE,
             aggregate_id,
             self.query_factory.select_events(),
             &mut **transaction,
@@ -313,7 +336,8 @@ impl PostgresEventRepository {
         aggregate_id: &str,
         last_sequence: usize,
     ) -> Result<Vec<SerializedEvent>, PersistenceError> {
-        self.select_events::<A>(
+        self.select_events(
+            A::TYPE,
             aggregate_id,
             self.query_factory.get_last_events(last_sequence),
             &mut **transaction,
@@ -647,6 +671,17 @@ mod test {
                 .await
                 .unwrap(),
             events[1..]
+        );
+        assert_eq!(
+            repository
+                .get_serialized_events_in(
+                    &mut transaction,
+                    <TestAggregate as cqrs_es::Aggregate>::TYPE,
+                    &id,
+                )
+                .await
+                .unwrap(),
+            events
         );
         transaction.rollback().await.unwrap();
         assert!(repository
