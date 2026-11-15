@@ -4,3 +4,5 @@
 **/*.rs.bk
 
 /docs/book/book
+
+.tmp/

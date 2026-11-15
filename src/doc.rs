@@ -15,7 +15,7 @@ pub enum MyEvents {
 }
 impl DomainEvent for MyEvents {
     fn event_type(&self) -> String {
-        format!("{:?}", &self)
+        format!("{:?}", self)
     }
     fn event_version(&self) -> String {
         "0.1.0".to_string()
