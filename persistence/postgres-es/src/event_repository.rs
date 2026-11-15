@@ -226,6 +226,19 @@ impl PostgresEventRepository {
         }
     }
 
+    /// Appends events using the caller's transaction, without committing it.
+    ///
+    /// This exposes the same transaction-local operation used by this repository's
+    /// ordinary persistence path. The caller owns commit and rollback.
+    pub async fn append_events_in<A: Aggregate>(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        events: &[SerializedEvent],
+    ) -> Result<usize, PostgresAggregateError> {
+        let query = self.query_factory.insert_event();
+        self.persist_events::<A>(query, transaction, events).await
+    }
+
     pub(crate) async fn insert_events<A: Aggregate>(
         &self,
         events: &[SerializedEvent],
@@ -386,6 +399,43 @@ mod test {
             source.downcast_ref::<sqlx::Error>().unwrap(),
             sqlx::Error::PoolClosed
         ));
+    }
+
+    #[tokio::test]
+    async fn transaction_local_append_leaves_commit_and_rollback_to_the_caller() {
+        let pool = default_postgres_pool(TEST_CONNECTION_STRING).await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let repository = PostgresEventRepository::new(pool.clone());
+        let events = [test_event_envelope(
+            &id,
+            1,
+            TestEvent::Created(Created { id: id.clone() }),
+        )];
+        let mut transaction = pool.begin().await.unwrap();
+        assert_eq!(
+            repository
+                .append_events_in::<TestAggregate>(&mut transaction, &events,)
+                .await
+                .unwrap(),
+            1
+        );
+        transaction.rollback().await.unwrap();
+        assert!(repository
+            .get_events::<TestAggregate>(&id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let mut transaction = pool.begin().await.unwrap();
+        repository
+            .append_events_in::<TestAggregate>(&mut transaction, &events)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        assert_eq!(
+            repository.get_events::<TestAggregate>(&id).await.unwrap(),
+            events
+        );
     }
 
     #[tokio::test]
