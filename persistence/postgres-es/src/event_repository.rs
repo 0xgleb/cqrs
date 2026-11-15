@@ -5,7 +5,7 @@ use cqrs_es::Aggregate;
 use futures::TryStreamExt;
 use serde_json::Value;
 use sqlx::postgres::PgRow;
-use sqlx::{Pool, Postgres, Row, SqlSafeStr, SqlStr, Transaction};
+use sqlx::{Executor, Pool, Postgres, Row, SqlSafeStr, SqlStr, Transaction};
 
 use crate::error::PostgresAggregateError;
 use crate::sql_query::SqlQueryFactory;
@@ -27,7 +27,7 @@ impl PersistedEventRepository for PostgresEventRepository {
         &self,
         aggregate_id: &str,
     ) -> Result<Vec<SerializedEvent>, PersistenceError> {
-        self.select_events::<A>(aggregate_id, self.query_factory.select_events())
+        self.select_events::<A>(aggregate_id, self.query_factory.select_events(), &self.pool)
             .await
     }
 
@@ -37,7 +37,8 @@ impl PersistedEventRepository for PostgresEventRepository {
         last_sequence: usize,
     ) -> Result<Vec<SerializedEvent>, PersistenceError> {
         let query = self.query_factory.get_last_events(last_sequence);
-        self.select_events::<A>(aggregate_id, query).await
+        self.select_events::<A>(aggregate_id, query, &self.pool)
+            .await
     }
 
     async fn get_snapshot<A: Aggregate>(
@@ -136,15 +137,16 @@ fn stream_events(
 }
 
 impl PostgresEventRepository {
-    async fn select_events<A: Aggregate>(
+    async fn select_events<'connection, A: Aggregate>(
         &self,
-        aggregate_id: &str,
+        aggregate_id: &'connection str,
         query: SqlStr,
+        executor: impl Executor<'connection, Database = Postgres>,
     ) -> Result<Vec<SerializedEvent>, PersistenceError> {
         let mut rows = sqlx::query(query)
             .bind(A::TYPE)
             .bind(aggregate_id)
-            .fetch(&self.pool);
+            .fetch(executor);
         let mut result = Vec::default();
         while let Some(row) = rows
             .try_next()
@@ -224,6 +226,35 @@ impl PostgresEventRepository {
             query_factory: SqlQueryFactory::new(events_table, snapshots_table),
             stream_channel_size: DEFAULT_STREAMING_CHANNEL_SIZE,
         }
+    }
+
+    /// Loads a stream using the caller's transaction and its visibility boundary.
+    pub async fn get_events_in<A: Aggregate>(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        aggregate_id: &str,
+    ) -> Result<Vec<SerializedEvent>, PersistenceError> {
+        self.select_events::<A>(
+            aggregate_id,
+            self.query_factory.select_events(),
+            &mut **transaction,
+        )
+        .await
+    }
+
+    /// Loads the stream suffix using the caller's transaction.
+    pub async fn get_last_events_in<A: Aggregate>(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        aggregate_id: &str,
+        last_sequence: usize,
+    ) -> Result<Vec<SerializedEvent>, PersistenceError> {
+        self.select_events::<A>(
+            aggregate_id,
+            self.query_factory.get_last_events(last_sequence),
+            &mut **transaction,
+        )
+        .await
     }
 
     /// Appends events using the caller's transaction, without committing it.
@@ -436,6 +467,49 @@ mod test {
             repository.get_events::<TestAggregate>(&id).await.unwrap(),
             events
         );
+    }
+
+    #[tokio::test]
+    async fn transaction_reads_see_uncommitted_events_and_filter_the_suffix() {
+        let pool = default_postgres_pool(TEST_CONNECTION_STRING).await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let repository = PostgresEventRepository::new(pool.clone());
+        let events = [
+            test_event_envelope(&id, 1, TestEvent::Created(Created { id: id.clone() })),
+            test_event_envelope(
+                &id,
+                2,
+                TestEvent::Tested(Tested {
+                    test_name: "transaction-local read".to_string(),
+                }),
+            ),
+        ];
+        let mut transaction = pool.begin().await.unwrap();
+        repository
+            .append_events_in::<TestAggregate>(&mut transaction, &events)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repository
+                .get_events_in::<TestAggregate>(&mut transaction, &id)
+                .await
+                .unwrap(),
+            events
+        );
+        assert_eq!(
+            repository
+                .get_last_events_in::<TestAggregate>(&mut transaction, &id, 1)
+                .await
+                .unwrap(),
+            events[1..]
+        );
+        transaction.rollback().await.unwrap();
+        assert!(repository
+            .get_events::<TestAggregate>(&id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
