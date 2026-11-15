@@ -87,8 +87,8 @@ impl<A: Aggregate> EventStore<A> for MemStore<A> {
         let events = self.load_committed_events(aggregate_id)?;
         println!(
             "loading: {} events for aggregate ID '{}'",
-            &events.len(),
-            &aggregate_id
+            events.len(),
+            aggregate_id
         );
         Ok(events)
     }
@@ -132,7 +132,7 @@ impl<A: Aggregate> EventStore<A> for MemStore<A> {
         }
         println!(
             "storing: {} new events for aggregate ID '{}'",
-            new_events_qty, &aggregate_id
+            new_events_qty, aggregate_id
         );
         // uninteresting unwrap: this is not a struct for production use
         self.events
