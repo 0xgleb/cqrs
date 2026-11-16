@@ -38,7 +38,8 @@ where
     pub fn new(view_name: impl SqlSafeStr, pool: Pool<Postgres>) -> Self {
         let view_sql_str = view_name.into_sql_str();
         let insert_sql = AssertSqlSafe(format!(
-            "INSERT INTO {} (payload, version, view_id) VALUES ( $1, $2, $3 )",
+            "INSERT INTO {} (payload, version, view_id) VALUES ( $1, $2, $3 ) \
+             ON CONFLICT (view_id) DO NOTHING",
             view_sql_str.as_str()
         ))
         .into_sql_str();
@@ -116,7 +117,7 @@ where
             .bind(context.version)
             .execute(&self.pool)
             .await
-            .map_err(PostgresAggregateError::from)?
+            .map_err(|source| PersistenceError::ConnectionError(Box::new(source)))?
             .rows_affected();
         if rows_affected < 1 {
             return Err(PersistenceError::OptimisticLockError);
