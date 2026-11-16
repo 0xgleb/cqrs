@@ -571,6 +571,15 @@ mod test {
             super::PostgresIndex::try_from(value).unwrap(),
             super::PostgresIndex(value)
         );
+        assert!(matches!(
+            super::PostgresIndex::try_from(0_usize).unwrap_err(),
+            PostgresAggregateError::NonPositiveIndex { value: 0 }
+        ));
+        #[cfg(target_pointer_width = "64")]
+        assert!(matches!(
+            super::PostgresIndex::try_from(usize::MAX).unwrap_err(),
+            PostgresAggregateError::Integer(_)
+        ));
         for value in [0_i64, -1] {
             assert!(matches!(super::PostgresIndex::try_from(value).unwrap_err(),
                 PostgresAggregateError::NonPositiveIndex { value: actual } if actual == value));

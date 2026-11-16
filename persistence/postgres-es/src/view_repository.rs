@@ -69,18 +69,7 @@ where
     A: Aggregate,
 {
     async fn load(&self, view_id: &str) -> Result<Option<V>, PersistenceError> {
-        let row: Option<PgRow> = sqlx::query(self.select_sql.clone())
-            .bind(view_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(PostgresAggregateError::from)?;
-        match row {
-            None => Ok(None),
-            Some(row) => {
-                let view = serde_json::from_value(row.get("payload"))?;
-                Ok(Some(view))
-            }
-        }
+        Ok(self.load_with_context(view_id).await?.map(|(view, _)| view))
     }
 
     async fn load_with_context(
@@ -95,8 +84,13 @@ where
         match row {
             None => Ok(None),
             Some(row) => {
-                let version = row.get("version");
-                let view = serde_json::from_value(row.get("payload"))?;
+                let version = row
+                    .try_get("version")
+                    .map_err(PostgresAggregateError::from)?;
+                let payload = row
+                    .try_get("payload")
+                    .map_err(PostgresAggregateError::from)?;
+                let view = serde_json::from_value(payload)?;
                 let view_context = ViewContext::new(view_id.to_string(), version);
                 Ok(Some((view, view_context)))
             }
