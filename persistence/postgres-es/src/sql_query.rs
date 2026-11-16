@@ -99,8 +99,12 @@ SELECT aggregate_type, aggregate_id, last_sequence, {} AS current_snapshot, payl
     pub fn all_events(&self) -> SqlStr {
         self.all_events.clone()
     }
-    pub fn get_last_events(&self, last_sequence: usize) -> SqlStr {
-        AssertSqlSafe(format!(
+    pub fn get_last_events(
+        &self,
+        last_sequence: usize,
+    ) -> Result<SqlStr, crate::error::PostgresAggregateError> {
+        let last_sequence = i64::try_from(last_sequence)?;
+        Ok(AssertSqlSafe(format!(
             "
 SELECT aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata
   FROM {}
@@ -109,8 +113,24 @@ SELECT aggregate_type, aggregate_id, sequence, event_type, event_version, payloa
             self.event_table.as_str(),
             last_sequence
         ))
-        .into_sql_str()
+        .into_sql_str())
     }
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn suffix_checkpoint_must_fit_the_stored_sequence_range() {
+    let factory = SqlQueryFactory::new("events", "snapshots", "current_snapshot");
+    let error = factory.get_last_events(usize::MAX).unwrap_err();
+    assert!(matches!(
+        error,
+        crate::error::PostgresAggregateError::Integer(_)
+    ));
+    assert!(factory
+        .get_last_events(0)
+        .unwrap()
+        .as_str()
+        .contains("sequence > 0"));
 }
 
 #[test]
@@ -156,7 +176,7 @@ SELECT aggregate_type, aggregate_id, last_sequence, current_snapshot AS current_
   WHERE aggregate_type = $1 AND aggregate_id = $2"
     );
     assert_eq!(
-        query_factory.get_last_events(20).as_str(),
+        query_factory.get_last_events(20).unwrap().as_str(),
         "
 SELECT aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata
   FROM my_events

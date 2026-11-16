@@ -64,7 +64,7 @@ impl PersistedEventRepository for PostgresEventRepository {
         aggregate_id: &str,
         last_sequence: usize,
     ) -> Result<Vec<SerializedEvent>, PersistenceError> {
-        let query = self.query_factory.get_last_events(last_sequence);
+        let query = self.query_factory.get_last_events(last_sequence)?;
         self.select_events(A::TYPE, aggregate_id, query, &self.pool)
             .await
     }
@@ -339,7 +339,7 @@ impl PostgresEventRepository {
         self.select_events(
             A::TYPE,
             aggregate_id,
-            self.query_factory.get_last_events(last_sequence),
+            self.query_factory.get_last_events(last_sequence)?,
             &mut **transaction,
         )
         .await
