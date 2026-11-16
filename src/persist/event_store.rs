@@ -219,15 +219,20 @@ where
             } else {
                 let snapshot = self.repo.get_snapshot::<A>(aggregate_id).await?;
                 match snapshot {
-                    Some(snapshot) => match snapshot.try_into() {
-                        Err(PersistenceError::DeserializationError(_)) => {
-                            deserialize_error_occured = true;
-                            // If aggregate structure changed, this will trigger replaying all the events
-                            // and rebuilding fresh aggregate state.
-                            EventStoreAggregateContext::context_for(aggregate_id, false)
+                    Some(snapshot) => {
+                        let snapshot_version = snapshot.current_snapshot;
+                        match snapshot.try_into() {
+                            Err(PersistenceError::DeserializationError(_)) => {
+                                deserialize_error_occured = true;
+                                // Replay from the beginning without resetting the stored write fence.
+                                let mut context =
+                                    EventStoreAggregateContext::context_for(aggregate_id, false);
+                                context.current_snapshot = Some(snapshot_version);
+                                context
+                            }
+                            result => result?,
                         }
-                        r => r?,
-                    },
+                    }
                     None => EventStoreAggregateContext::context_for(aggregate_id, false),
                 }
             };
@@ -300,7 +305,12 @@ where
                 context.current_sequence += 1;
             }
         }
-        let next_snapshot = context.current_snapshot.map_or(1, |val| val + 1);
+        let next_snapshot = match context.current_snapshot {
+            None => 1,
+            Some(version) => version
+                .checked_add(1)
+                .ok_or_else(|| PersistenceError::UnknownError(Box::new(SnapshotVersionOverflow)))?,
+        };
         let payload = serde_json::to_value(context.aggregate)?;
         Ok(Some(SerializedSnapshot {
             aggregate_id: context.aggregate_id,
@@ -329,6 +339,10 @@ where
             .collect()
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("snapshot version cannot advance beyond usize::MAX")]
+struct SnapshotVersionOverflow;
 
 #[cfg(test)]
 pub(crate) mod shared_test {
@@ -843,6 +857,29 @@ pub(crate) mod snapshotted_store_test {
     use crate::{AggregateError, DomainEvent, EventStore};
 
     #[tokio::test]
+    async fn fallback_snapshot_version_overflow_is_a_typed_error() {
+        let repo = MockRepo::with_last_events(
+            Ok(vec![test_serialized_event(1, TestEvents::SomethingWasDone)]),
+            Ok(Some(SerializedSnapshot {
+                aggregate_id: TEST_AGGREGATE_ID.to_string(),
+                aggregate: json!({"incompatible": true}),
+                current_sequence: 1,
+                current_snapshot: usize::MAX,
+            })),
+        );
+        let store = PersistedEventStore::<MockRepo, TestAggregate>::new_snapshot_store(repo, 1);
+        let context = store.load_aggregate(TEST_AGGREGATE_ID).await.unwrap();
+        let error = store
+            .commit(vec![TestEvents::SomethingWasDone], context, HashMap::new())
+            .await
+            .unwrap_err();
+        let AggregateError::UnexpectedError(source) = error else {
+            panic!("expected a typed snapshot version overflow");
+        };
+        source.downcast::<super::SnapshotVersionOverflow>().unwrap();
+    }
+
+    #[tokio::test]
     async fn load() {
         let repo = MockRepo::with_events(Ok(vec![test_serialized_event(
             1,
@@ -936,7 +973,7 @@ pub(crate) mod snapshotted_store_test {
 
         let store = PersistedEventStore::<MockRepo, TestAggregate>::new_snapshot_store(repo, 2);
         let snapshot_context = store.load_aggregate(TEST_AGGREGATE_ID).await.unwrap();
-        assert_eq!(None, snapshot_context.current_snapshot);
+        assert_eq!(Some(1), snapshot_context.current_snapshot);
         assert_eq!(2, snapshot_context.current_sequence);
         assert_eq!(TEST_AGGREGATE_ID, snapshot_context.aggregate_id);
         assert_eq!(
@@ -1212,7 +1249,7 @@ pub(crate) mod aggregate_store_test {
 
         let store = PersistedEventStore::<MockRepo, TestAggregate>::new_aggregate_store(repo);
         let snapshot_context = store.load_aggregate(TEST_AGGREGATE_ID).await.unwrap();
-        assert_eq!(None, snapshot_context.current_snapshot);
+        assert_eq!(Some(1), snapshot_context.current_snapshot);
         assert_eq!(2, snapshot_context.current_sequence);
         assert_eq!(TEST_AGGREGATE_ID, snapshot_context.aggregate_id);
         assert_eq!(
