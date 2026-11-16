@@ -38,7 +38,8 @@ where
     pub fn new(view_name: impl SqlSafeStr, pool: Pool<Postgres>) -> Self {
         let view_sql_str = view_name.into_sql_str();
         let insert_sql = AssertSqlSafe(format!(
-            "INSERT INTO {} (payload, version, view_id) VALUES ( $1, $2, $3 )",
+            "INSERT INTO {} (payload, version, view_id) VALUES ( $1, $2, $3 ) \
+             ON CONFLICT (view_id) DO NOTHING",
             view_sql_str.as_str()
         ))
         .into_sql_str();
@@ -68,18 +69,7 @@ where
     A: Aggregate,
 {
     async fn load(&self, view_id: &str) -> Result<Option<V>, PersistenceError> {
-        let row: Option<PgRow> = sqlx::query(self.select_sql.clone())
-            .bind(view_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(PostgresAggregateError::from)?;
-        match row {
-            None => Ok(None),
-            Some(row) => {
-                let view = serde_json::from_value(row.get("payload"))?;
-                Ok(Some(view))
-            }
-        }
+        Ok(self.load_with_context(view_id).await?.map(|(view, _)| view))
     }
 
     async fn load_with_context(
@@ -94,8 +84,13 @@ where
         match row {
             None => Ok(None),
             Some(row) => {
-                let version = row.get("version");
-                let view = serde_json::from_value(row.get("payload"))?;
+                let version = row
+                    .try_get("version")
+                    .map_err(PostgresAggregateError::from)?;
+                let payload = row
+                    .try_get("payload")
+                    .map_err(PostgresAggregateError::from)?;
+                let view = serde_json::from_value(payload)?;
                 let view_context = ViewContext::new(view_id.to_string(), version);
                 Ok(Some((view, view_context)))
             }
@@ -116,7 +111,7 @@ where
             .bind(context.version)
             .execute(&self.pool)
             .await
-            .map_err(PostgresAggregateError::from)?
+            .map_err(|source| PersistenceError::ConnectionError(Box::new(source)))?
             .rows_affected();
         if rows_affected < 1 {
             return Err(PersistenceError::OptimisticLockError);

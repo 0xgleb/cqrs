@@ -4,6 +4,10 @@ use sqlx::Error;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PostgresAggregateError {
+    #[error(transparent)]
+    Integer(#[from] std::num::TryFromIntError),
+    #[error("stored index must be positive: {value}")]
+    NonPositiveIndex { value: i64 },
     #[error("optimistic lock error")]
     OptimisticLock,
     #[error(transparent)]
@@ -26,7 +30,9 @@ impl From<sqlx::Error> for PostgresAggregateError {
                 }
                 Self::UnknownError(Box::new(err))
             }
-            Error::Io(_) | Error::Tls(_) => Self::ConnectionError(Box::new(err)),
+            Error::Io(_) | Error::Tls(_) | Error::PoolClosed => {
+                Self::ConnectionError(Box::new(err))
+            }
             _ => Self::UnknownError(Box::new(err)),
         }
     }
@@ -35,6 +41,10 @@ impl From<sqlx::Error> for PostgresAggregateError {
 impl<T: std::error::Error> From<PostgresAggregateError> for AggregateError<T> {
     fn from(err: PostgresAggregateError) -> Self {
         match err {
+            invalid @ (PostgresAggregateError::Integer(_)
+            | PostgresAggregateError::NonPositiveIndex { .. }) => {
+                Self::UnexpectedError(Box::new(invalid))
+            }
             PostgresAggregateError::OptimisticLock => Self::AggregateConflict,
             PostgresAggregateError::ConnectionError(error) => Self::DatabaseConnectionError(error),
             PostgresAggregateError::DeserializationError(error) => {
@@ -61,6 +71,10 @@ impl From<serde_json::Error> for PostgresAggregateError {
 impl From<PostgresAggregateError> for PersistenceError {
     fn from(err: PostgresAggregateError) -> Self {
         match err {
+            invalid @ (PostgresAggregateError::Integer(_)
+            | PostgresAggregateError::NonPositiveIndex { .. }) => {
+                Self::UnknownError(Box::new(invalid))
+            }
             PostgresAggregateError::OptimisticLock => Self::OptimisticLockError,
             PostgresAggregateError::ConnectionError(error) => Self::ConnectionError(error),
             PostgresAggregateError::DeserializationError(error) => Self::UnknownError(error),
